@@ -1,54 +1,46 @@
-from fastapi import FastAPI, Body, Request
+from fastapi import FastAPI, Body
 from fastapi.responses import FileResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor
+import subprocess, uuid, requests, os
 from pathlib import Path
-import subprocess, uuid, requests, os, shutil, textwrap
 
 app = FastAPI(title="Video Reels API")
 WORKDIR = Path("/tmp"); WORKDIR.mkdir(exist_ok=True)
 
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 executor = ThreadPoolExecutor(max_workers=1)
-JOBS: dict[str, dict] = {}
+JOBS: dict[str, dict] = {}  # job_id -> {"status": "...", "out": Path, "error": str|None}
 
-# ---------- helpers ----------
 
-def _download(url: str, suffix: str) -> Path:
-    p = WORKDIR / f"{uuid.uuid4()}{suffix}"
-    r = requests.get(url, stream=True, timeout=(10, 600))
+def _process(video_url: str, music_url: str | None, text: str, out_path: Path):
+    # скачиваем видео
+    in_video = WORKDIR / f"{uuid.uuid4()}_in.mp4"
+    r = requests.get(video_url, stream=True, timeout=(10, 600))
     r.raise_for_status()
-    with open(p, "wb") as f:
+    with open(in_video, "wb") as f:
         for chunk in r.iter_content(1024*1024):
             if chunk: f.write(chunk)
-    return p
 
-def _escape_drawtext(txt: str) -> str:
-    return (txt or "").replace("\\", r"\\\\").replace(":", r"\:").replace("'", r"\'").replace('"', r"\'").replace("\n", r"\n")
+    in_audio = None
+    if music_url:
+        in_audio = WORKDIR / f"{uuid.uuid4()}_in_audio"
+        r = requests.get(music_url, stream=True, timeout=(10, 600))
+        r.raise_for_status()
+        with open(in_audio, "wb") as f:
+            for chunk in r.iter_content(1024*1024):
+                if chunk: f.write(chunk)
 
-def _wrap_hook_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: int = 80) -> str:
-    if not text:
-        return ""
-    avg = 0.6 * fontsize
-    max_chars = max(8, int((canvas_w - 2*side_pad) / avg))
-    wrapped = textwrap.fill(text.strip(), width=max_chars)
-    return wrapped
+    # параметры канвы
+    CANVAS_W, CANVAS_H = 720, 1280
+    FONT_SIZE = 56
+    FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# ---------- core ----------
+    # текст с экранированием
+    safe_text = text.replace(":", r"\:").replace("'", r"\'")
 
-def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Path, job_id: str):
-    in_video = _download(video_url, "_in.mp4")
-    in_audio = _download(music_url, "_in_audio") if music_url else None
+    # формула позиции: чуть выше видео
+    HOOK_Y_EXPR = "((oh-ih)/2)-(text_h+24)"
 
-    CANVAS_W, CANVAS_H = 1080, 1920
-    FONT_SIZE = 72
-    MARGIN = 24
-
-    hook_wrapped = _wrap_hook_text(hook_text, canvas_w=CANVAS_W, fontsize=FONT_SIZE, side_pad=80)
-    safe_text = _escape_drawtext(hook_wrapped)
-
-    # y = верх видео - высота текста - отступ
-    HOOK_Y_EXPR = f"(oh-ih)/2-text_h-{MARGIN}"
-
+    # собираем фильтры
     vf = (
         f"scale={CANVAS_W}:-2:force_original_aspect_ratio=decrease,"
         f"pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:black,"
@@ -59,77 +51,67 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
         f"y={HOOK_Y_EXPR}"
     )
 
-    cmd = ["ffmpeg","-y","-i",str(in_video)]
+    cmd = [
+        "ffmpeg","-y","-i",str(in_video),
+    ]
     if in_audio:
-        cmd += ["-stream_loop","-1","-i",str(in_audio), "-map","0:v:0","-map","1:a:0","-c:a","aac","-b:a","192k"]
+        cmd += ["-i", str(in_audio), "-map", "0:v", "-map", "1:a", "-shortest"]
     else:
         cmd += ["-an"]
 
-    cmd += ["-vf", vf, "-c:v","libx264","-preset","ultrafast","-crf","22", "-shortest", str(out_path)]
+    cmd += ["-vf", vf, "-c:v","libx264","-preset","ultrafast","-crf","25", str(out_path)]
+    subprocess.run(cmd, check=True)
 
-    try:
-        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        JOBS[job_id]["stderr"] = proc.stderr.decode("utf-8", "ignore")[-2000:] or None
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", "ignore")
-        JOBS[job_id]["stderr"] = err[-4000:]
-        raise RuntimeError(JOBS[job_id]["stderr"])
-    finally:
-        for p in (in_video, in_audio):
-            if p and os.path.exists(p):
-                try: os.remove(p)
-                except: pass
-
-# ---------- API ----------
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(): 
+    return {"status":"ok"}
+
 
 @app.post("/process_links_async")
 def process_links_async(payload: dict = Body(...)):
     video_url = payload.get("video_url")
     music_url = payload.get("music_url")
-    hook_text = payload.get("text", "Ваш заголовок")
+    text = payload.get("text","Мой текст")
     if not video_url:
         return JSONResponse({"error":"video_url is required"}, status_code=400)
 
     job_id = uuid.uuid4().hex
     out_path = WORKDIR / f"{job_id}.mp4"
-    JOBS[job_id] = {"status":"queued", "out": out_path, "error": None, "stderr": None}
+    JOBS[job_id] = {"status":"queued", "out": out_path, "error": None}
 
     def run():
         try:
             JOBS[job_id]["status"] = "running"
-            _process(video_url, music_url, hook_text, out_path, job_id)
+            _process(video_url, music_url, text, out_path)
             JOBS[job_id]["status"] = "done"
         except Exception as e:
             JOBS[job_id]["status"] = "error"
             JOBS[job_id]["error"] = str(e)
 
     executor.submit(run)
-    return {"job_id": job_id, "status": "queued",
-            "status_url": f"/status/{job_id}",
-            "result_url": f"/result/{job_id}"}
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "result_url": f"/result/{job_id}",
+        "status_url": f"/status/{job_id}"
+    }
+
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
     job = JOBS.get(job_id)
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
-    return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
+    return {"job_id": job_id, "status": job["status"], "error": job["error"]}
+
 
 @app.get("/result/{job_id}")
-def result(job_id: str, request: Request):
+def result(job_id: str):
     job = JOBS.get(job_id)
-    if not job: return JSONResponse({"error":"not found"}, status_code=404)
-    if job["status"] != "done": return JSONResponse({"error":"not ready", "status": job["status"]}, status_code=425)
-    base_url = str(request.base_url).rstrip("/")
-    download_url = f"{base_url}/download/{job_id}"
-    return {"download_url": download_url}
+    if not job: 
+        return JSONResponse({"error":"not found"}, status_code=404)
+    if job["status"] != "done": 
+        return JSONResponse({"error":"not ready", "status": job["status"]}, status_code=425)
 
-@app.get("/download/{job_id}")
-def download(job_id: str):
-    job = JOBS.get(job_id)
-    if not job: return JSONResponse({"error":"not found"}, status_code=404)
-    if job["status"] != "done": return JSONResponse({"error":"not ready"}, status_code=425)
-    return FileResponse(str(job["out"]), filename=f"processed_{job_id}.mp4")
+    # отдаём готовый mp4
+    return FileResponse(str(job["out"]), filename=f"processed_{job_id}.mp4", media_type="video/mp4")
