@@ -2,7 +2,7 @@ from fastapi import FastAPI, Body, Request
 from fastapi.responses import FileResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import subprocess, uuid, requests, os, shutil, textwrap
+import subprocess, uuid, requests, os, textwrap
 
 app = FastAPI(title="Video Reels API")
 WORKDIR = Path("/tmp"); WORKDIR.mkdir(exist_ok=True)
@@ -22,10 +22,9 @@ def _download(url: str, suffix: str) -> Path:
     return p
 
 def _wrap_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: int = 80) -> str:
-    """Грубая, но стабильная оценка переносов по ширине."""
     if not text:
         return ""
-    avg = 0.6 * fontsize  # средняя ширина глифа
+    avg = 0.6 * fontsize
     max_chars = max(8, int((canvas_w - 2*side_pad) / avg))
     return textwrap.fill(text.strip(), width=max_chars)
 
@@ -38,18 +37,17 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
     FONT_SIZE = 72
     MARGIN = 24
 
-    # переносим строки и пишем в файл (без экранирования проблемных символов)
     wrapped = _wrap_text(hook_text, canvas_w=CANVAS_W, fontsize=FONT_SIZE, side_pad=80)
     textfile = WORKDIR / f"{uuid.uuid4()}_hook.txt"
     textfile.write_text(wrapped, encoding="utf-8")
 
-    # y = верхняя граница видео - высота текста - отступ
-    HOOK_Y_EXPR = "((oh-ih)/2)-(text_h+{m})".format(m=MARGIN)
+    # Для 16:9: высота видео ≈ w*0.5625; верх видео ≈ (h - w*0.5625)/2
+    # y = верх видео - высота текста - отступ; не даём подняться слишком высоко (>=40)
+    HOOK_Y_EXPR = f"max(40, (h - w*0.5625)/2 - text_h - {MARGIN})"
 
     vf = (
         f"scale={CANVAS_W}:-2:force_original_aspect_ratio=decrease,"
         f"pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:black,"
-        # жирный хук вверху, прижат к видео
         f"drawtext=fontfile={FONT_BOLD}:textfile='{textfile}':"
         f"fontcolor=white:fontsize={FONT_SIZE}:line_spacing=8:"
         "box=1:boxcolor=black@0.5:boxborderw=16:"
@@ -59,7 +57,6 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
 
     cmd = ["ffmpeg","-y","-i",str(in_video)]
     if in_audio:
-        # зациклим музыку, чтобы хватило на длину видео
         cmd += ["-stream_loop","-1","-i",str(in_audio), "-map","0:v:0","-map","1:a:0","-c:a","aac","-b:a","192k"]
     else:
         cmd += ["-an"]
@@ -115,7 +112,6 @@ def status(job_id: str):
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
     return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
 
-# result -> отдаем ссылку для скачивания
 @app.get("/result/{job_id}")
 def result(job_id: str, request: Request):
     job = JOBS.get(job_id)
