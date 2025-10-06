@@ -11,7 +11,6 @@ FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 executor = ThreadPoolExecutor(max_workers=1)
 JOBS: dict[str, dict] = {}  # job_id -> {"status": "...", "out": Path, "error": str|None, "stderr": str|None}
 
-
 # ---------- helpers ----------
 def _download(url: str, suffix: str) -> Path:
     p = WORKDIR / f"{uuid.uuid4()}{suffix}"
@@ -23,7 +22,6 @@ def _download(url: str, suffix: str) -> Path:
                 f.write(chunk)
     return p
 
-
 def _wrap_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: int = 80) -> str:
     """Грубый устойчивый перенос по ширине канвы."""
     if not text:
@@ -31,7 +29,6 @@ def _wrap_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: in
     avg = 0.6 * fontsize  # средняя ширина глифа
     max_chars = max(8, int((canvas_w - 2 * side_pad) / avg))
     return textwrap.fill(text.strip(), width=max_chars)
-
 
 # ---------- core ----------
 def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Path, job_id: str):
@@ -47,9 +44,9 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
     textfile = WORKDIR / f"{uuid.uuid4()}_hook.txt"
     textfile.write_text(wrapped, encoding="utf-8")
 
-    # позиция хука: прижать к верхней кромке видео (предполагаем горизонтальное 16:9)
+    # позиция хука: прижать к верхней кромке видео (горизонтальное 16:9)
     # высота видео ~ w*0.5625, верх видео ~ (h - w*0.5625)/2
-    # финально: y = max(40, верх - text_h - MARGIN)
+    # y = max(40, верх - text_h - MARGIN)
     HOOK_Y_EXPR = f"max(40,(h-(w*0.5625))/2-text_h-{MARGIN})"
 
     vf = (
@@ -59,13 +56,14 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
         f"fontcolor=white:fontsize={FONT_SIZE}:line_spacing=8:"
         "box=1:boxcolor=black@0.5:boxborderw=16:"
         "x=(w-text_w)/2:"
-        f"y={HOOK_Y_EXPR}"
+        f"y='{HOOK_Y_EXPR}'"   # <<< ключевая правка — выражение взято в кавычки
     )
 
     cmd = ["ffmpeg", "-y", "-i", str(in_video)]
     if in_audio:
         # зацикливаем музыку, чтобы хватило на длину видео
-        cmd += ["-stream_loop", "-1", "-i", str(in_audio), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-stream_loop", "-1", "-i", str(in_audio),
+                "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-an"]
 
@@ -80,17 +78,13 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
     finally:
         for p in (in_video, in_audio, textfile):
             if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except:
-                    pass
-
+                try: os.remove(p)
+                except: pass
 
 # ---------- API ----------
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/process_links_async")
 def process_links_async(payload: dict = Body(...)):
@@ -121,14 +115,12 @@ def process_links_async(payload: dict = Body(...)):
         "result_url": f"/result/{job_id}",
     }
 
-
 @app.get("/status/{job_id}")
 def status(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         return JSONResponse({"error": "not found"}, status_code=404)
     return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
-
 
 # /result -> отдаём ссылку для скачивания
 @app.get("/result/{job_id}")
@@ -141,7 +133,6 @@ def result(job_id: str, request: Request):
     base_url = str(request.base_url).rstrip("/")
     download_url = f"{base_url}/download/{job_id}"
     return {"download_url": download_url}
-
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
