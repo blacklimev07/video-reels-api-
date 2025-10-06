@@ -2,15 +2,12 @@ from fastapi import FastAPI, Body, Request
 from fastapi.responses import FileResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import subprocess, uuid, requests, os, shutil, math
-import textwrap
+import subprocess, uuid, requests, os, shutil, textwrap
 
 app = FastAPI(title="Video Reels API")
 WORKDIR = Path("/tmp"); WORKDIR.mkdir(exist_ok=True)
 
-# Шрифты из образа (fonts-dejavu-core)
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
 executor = ThreadPoolExecutor(max_workers=1)
 JOBS: dict[str, dict] = {}
 
@@ -26,18 +23,13 @@ def _download(url: str, suffix: str) -> Path:
     return p
 
 def _escape_drawtext(txt: str) -> str:
-    return (txt or "").replace("\\", r"\\\\").replace(":", r"\:").replace("'", r"\'").replace("\n", r"\n")
+    return (txt or "").replace("\\", r"\\\\").replace(":", r"\:").replace("'", r"\'").replace('"', r"\'").replace("\n", r"\n")
 
 def _wrap_hook_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: int = 80) -> str:
-    """
-    Простой перенос: оцениваем среднюю ширину глифа ~ 0.6*fontsize.
-    usable_w = canvas_w - 2*side_pad.
-    """
     if not text:
         return ""
     avg = 0.6 * fontsize
     max_chars = max(8, int((canvas_w - 2*side_pad) / avg))
-    # перенос только по словам
     wrapped = textwrap.fill(text.strip(), width=max_chars)
     return wrapped
 
@@ -47,34 +39,19 @@ def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Pa
     in_video = _download(video_url, "_in.mp4")
     in_audio = _download(music_url, "_in_audio") if music_url else None
 
-    # Параметры «инстаграм-формата»
     CANVAS_W, CANVAS_H = 1080, 1920
-    FONT_SIZE = 72   # крупный хук
-    MARGIN = 24      # зазор от текста до видео
-    TOP_SAFE = 40    # отступ от самой верхней кромки
+    FONT_SIZE = 72
+    MARGIN = 24
 
-    # перенос строк для hook
     hook_wrapped = _wrap_hook_text(hook_text, canvas_w=CANVAS_W, fontsize=FONT_SIZE, side_pad=80)
     safe_text = _escape_drawtext(hook_wrapped)
 
-    """
-    Фильтр:
-      1) Масштаб видео по ширине 1080 с сохранением пропорций.
-      2) Центрируем на чёрном фоне 1080x1920.
-      3) Рисуем хук сверху, прижимаем к видео (на типичном 16:9 даёт небольшой зазор).
-         Для 16:9 высота видео ≈ 608 => верхний «бар» ≈ (1920-608)/2 = 656.
-         Ставим текст на y = max(TOP_SAFE, 656 - text_h - MARGIN),
-         чтобы он не «лип» к самой кромке, но был близко к видео.
-    """
-    # позиция текста: «почти над видео» (подогнано под горизонтальное 16:9)
-    HOOK_Y_EXPR = f"max({TOP_SAFE}, 656 - text_h - {MARGIN})"
+    # y = верх видео - высота текста - отступ
+    HOOK_Y_EXPR = f"(oh-ih)/2-text_h-{MARGIN}"
 
     vf = (
-        # вписываем по ширине 1080
         f"scale={CANVAS_W}:-2:force_original_aspect_ratio=decrease,"
-        # кладём на 1080x1920 по центру
         f"pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:black,"
-        # хук (жирный, центр, бокс для читаемости)
         f"drawtext=fontfile={FONT_BOLD}:text='{safe_text}':"
         f"fontcolor=white:fontsize={FONT_SIZE}:line_spacing=8:"
         "box=1:boxcolor=black@0.5:boxborderw=16:"
@@ -113,7 +90,7 @@ def health():
 def process_links_async(payload: dict = Body(...)):
     video_url = payload.get("video_url")
     music_url = payload.get("music_url")
-    hook_text = payload.get("text", "Ваш заголовок")  # хук
+    hook_text = payload.get("text", "Ваш заголовок")
     if not video_url:
         return JSONResponse({"error":"video_url is required"}, status_code=400)
 
@@ -141,7 +118,6 @@ def status(job_id: str):
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
     return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
 
-# result -> отдаём ссылку для скачивания
 @app.get("/result/{job_id}")
 def result(job_id: str, request: Request):
     job = JOBS.get(job_id)
