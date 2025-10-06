@@ -1,16 +1,20 @@
 from fastapi import FastAPI, Body, Request
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.responses import RedirectResponse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import subprocess, uuid, requests, os, shutil
+import subprocess, uuid, requests, os, shutil, math
+import textwrap
 
 app = FastAPI(title="Video Reels API")
 WORKDIR = Path("/tmp"); WORKDIR.mkdir(exist_ok=True)
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+# Шрифты из образа (fonts-dejavu-core)
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
 executor = ThreadPoolExecutor(max_workers=1)
-JOBS: dict[str, dict] = {}  # job_id -> {"status": "...", "out": Path, "error": str|None, "stderr": str|None}
+JOBS: dict[str, dict] = {}
+
+# ---------- helpers ----------
 
 def _download(url: str, suffix: str) -> Path:
     p = WORKDIR / f"{uuid.uuid4()}{suffix}"
@@ -22,18 +26,60 @@ def _download(url: str, suffix: str) -> Path:
     return p
 
 def _escape_drawtext(txt: str) -> str:
-    return txt.replace("\\", r"\\\\").replace(":", r"\:").replace("'", r"\'").replace("\n", r"\n")
+    return (txt or "").replace("\\", r"\\\\").replace(":", r"\:").replace("'", r"\'").replace("\n", r"\n")
 
-def _process(video_url: str, music_url: str | None, text: str, out_path: Path, job_id: str):
+def _wrap_hook_text(text: str, canvas_w: int = 1080, fontsize: int = 72, side_pad: int = 80) -> str:
+    """
+    Простой перенос: оцениваем среднюю ширину глифа ~ 0.6*fontsize.
+    usable_w = canvas_w - 2*side_pad.
+    """
+    if not text:
+        return ""
+    avg = 0.6 * fontsize
+    max_chars = max(8, int((canvas_w - 2*side_pad) / avg))
+    # перенос только по словам
+    wrapped = textwrap.fill(text.strip(), width=max_chars)
+    return wrapped
+
+# ---------- core ----------
+
+def _process(video_url: str, music_url: str | None, hook_text: str, out_path: Path, job_id: str):
     in_video = _download(video_url, "_in.mp4")
     in_audio = _download(music_url, "_in_audio") if music_url else None
 
-    safe_text = _escape_drawtext(text or "")
+    # Параметры «инстаграм-формата»
+    CANVAS_W, CANVAS_H = 1080, 1920
+    FONT_SIZE = 72   # крупный хук
+    MARGIN = 24      # зазор от текста до видео
+    TOP_SAFE = 40    # отступ от самой верхней кромки
+
+    # перенос строк для hook
+    hook_wrapped = _wrap_hook_text(hook_text, canvas_w=CANVAS_W, fontsize=FONT_SIZE, side_pad=80)
+    safe_text = _escape_drawtext(hook_wrapped)
+
+    """
+    Фильтр:
+      1) Масштаб видео по ширине 1080 с сохранением пропорций.
+      2) Центрируем на чёрном фоне 1080x1920.
+      3) Рисуем хук сверху, прижимаем к видео (на типичном 16:9 даёт небольшой зазор).
+         Для 16:9 высота видео ≈ 608 => верхний «бар» ≈ (1920-608)/2 = 656.
+         Ставим текст на y = max(TOP_SAFE, 656 - text_h - MARGIN),
+         чтобы он не «лип» к самой кромке, но был близко к видео.
+    """
+    # позиция текста: «почти над видео» (подогнано под горизонтальное 16:9)
+    HOOK_Y_EXPR = f"max({TOP_SAFE}, 656 - text_h - {MARGIN})"
+
     vf = (
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
-        f"drawtext=fontfile={FONT_PATH}:text='{safe_text}':"
-        "fontcolor=white:fontsize=56:box=1:boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=80"
+        # вписываем по ширине 1080
+        f"scale={CANVAS_W}:-2:force_original_aspect_ratio=decrease,"
+        # кладём на 1080x1920 по центру
+        f"pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:black,"
+        # хук (жирный, центр, бокс для читаемости)
+        f"drawtext=fontfile={FONT_BOLD}:text='{safe_text}':"
+        f"fontcolor=white:fontsize={FONT_SIZE}:line_spacing=8:"
+        "box=1:boxcolor=black@0.5:boxborderw=16:"
+        "x=(w-text_w)/2:"
+        f"y={HOOK_Y_EXPR}"
     )
 
     cmd = ["ffmpeg","-y","-i",str(in_video)]
@@ -42,7 +88,7 @@ def _process(video_url: str, music_url: str | None, text: str, out_path: Path, j
     else:
         cmd += ["-an"]
 
-    cmd += ["-vf", vf, "-c:v","libx264","-preset","ultrafast","-crf","23", "-shortest", str(out_path)]
+    cmd += ["-vf", vf, "-c:v","libx264","-preset","ultrafast","-crf","22", "-shortest", str(out_path)]
 
     try:
         proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -50,22 +96,24 @@ def _process(video_url: str, music_url: str | None, text: str, out_path: Path, j
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", "ignore")
         JOBS[job_id]["stderr"] = err[-4000:]
-        raise RuntimeError(f"ffmpeg failed: {JOBS[job_id]['stderr']}")
+        raise RuntimeError(JOBS[job_id]["stderr"])
     finally:
         for p in (in_video, in_audio):
-            if p and os.path.exists(p): 
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except: pass
 
+# ---------- API ----------
+
 @app.get("/health")
-def health(): 
-    return {"status":"ok"}
+def health():
+    return {"status": "ok"}
 
 @app.post("/process_links_async")
 def process_links_async(payload: dict = Body(...)):
     video_url = payload.get("video_url")
     music_url = payload.get("music_url")
-    text = payload.get("text","Мой текст")
+    hook_text = payload.get("text", "Ваш заголовок")  # хук
     if not video_url:
         return JSONResponse({"error":"video_url is required"}, status_code=400)
 
@@ -76,7 +124,7 @@ def process_links_async(payload: dict = Body(...)):
     def run():
         try:
             JOBS[job_id]["status"] = "running"
-            _process(video_url, music_url, text, out_path, job_id)
+            _process(video_url, music_url, hook_text, out_path, job_id)
             JOBS[job_id]["status"] = "done"
         except Exception as e:
             JOBS[job_id]["status"] = "error"
@@ -93,7 +141,7 @@ def status(job_id: str):
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
     return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
 
-# теперь result не отдает файл, а возвращает ссылку download_url
+# result -> отдаём ссылку для скачивания
 @app.get("/result/{job_id}")
 def result(job_id: str, request: Request):
     job = JOBS.get(job_id)
