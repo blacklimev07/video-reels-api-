@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess, uuid, requests, os, shutil
@@ -7,7 +8,7 @@ import subprocess, uuid, requests, os, shutil
 app = FastAPI(title="Video Reels API")
 WORKDIR = Path("/tmp"); WORKDIR.mkdir(exist_ok=True)
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"  # важно для drawtext
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 executor = ThreadPoolExecutor(max_workers=1)
 JOBS: dict[str, dict] = {}  # job_id -> {"status": "...", "out": Path, "error": str|None, "stderr": str|None}
 
@@ -58,14 +59,12 @@ def _process(video_url: str, music_url: str | None, text: str, out_path: Path, j
 
 @app.get("/health")
 def health(): 
-    # небольшая диагностика окружения
-    ffmpeg_path = shutil.which("ffmpeg")
-    return {"status":"ok", "ffmpeg": bool(ffmpeg_path), "ffmpeg_path": ffmpeg_path}
+    return {"status":"ok"}
 
 @app.post("/process_links_async")
 def process_links_async(payload: dict = Body(...)):
     video_url = payload.get("video_url")
-    music_url = payload.get("music_url")  # может быть None
+    music_url = payload.get("music_url")
     text = payload.get("text","Мой текст")
     if not video_url:
         return JSONResponse({"error":"video_url is required"}, status_code=400)
@@ -84,7 +83,9 @@ def process_links_async(payload: dict = Body(...)):
             JOBS[job_id]["error"] = str(e)
 
     executor.submit(run)
-    return {"job_id": job_id, "status": "queued", "result_url": f"/result/{job_id}", "status_url": f"/status/{job_id}"}
+    return {"job_id": job_id, "status": "queued",
+            "status_url": f"/status/{job_id}",
+            "result_url": f"/result/{job_id}"}
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
@@ -92,9 +93,19 @@ def status(job_id: str):
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
     return {"job_id": job_id, "status": job["status"], "error": job["error"], "stderr_tail": job["stderr"]}
 
+# теперь result не отдает файл, а возвращает ссылку download_url
 @app.get("/result/{job_id}")
-def result(job_id: str):
+def result(job_id: str, request: Request):
     job = JOBS.get(job_id)
     if not job: return JSONResponse({"error":"not found"}, status_code=404)
     if job["status"] != "done": return JSONResponse({"error":"not ready", "status": job["status"]}, status_code=425)
+    base_url = str(request.base_url).rstrip("/")
+    download_url = f"{base_url}/download/{job_id}"
+    return {"download_url": download_url}
+
+@app.get("/download/{job_id}")
+def download(job_id: str):
+    job = JOBS.get(job_id)
+    if not job: return JSONResponse({"error":"not found"}, status_code=404)
+    if job["status"] != "done": return JSONResponse({"error":"not ready"}, status_code=425)
     return FileResponse(str(job["out"]), filename=f"processed_{job_id}.mp4")
